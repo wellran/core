@@ -1,9 +1,0 @@
-{
-    "state": {
-        "_": {
-            "off": "off",
-            "on": "on"
-        }
-    },
-    "title": "Entrada booleana"
-}

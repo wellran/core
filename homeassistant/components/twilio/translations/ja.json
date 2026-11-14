@@ -1,9 +1,0 @@
-{
-    "config": {
-        "step": {
-            "user": {
-                "title": "Twilio Webhook\u306e\u8a2d\u5b9a"
-            }
-        }
-    }
-}

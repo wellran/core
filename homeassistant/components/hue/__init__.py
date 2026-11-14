@@ -1,79 +1,83 @@
 """Support for the Philips Hue system."""
-import asyncio
-import logging
 
 from aiohue.util import normalize_bridge_id
-import voluptuous as vol
 
-from homeassistant import config_entries, core
-from homeassistant.components import persistent_notification
+from homeassistant.config_entries import SOURCE_IGNORE
+from homeassistant.const import CONF_HOST
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import config_validation as cv, device_registry as dr
-from homeassistant.helpers.service import verify_domain_control
+from homeassistant.helpers.typing import ConfigType
 
-from .bridge import HueBridge
-from .const import (
-    ATTR_GROUP_NAME,
-    ATTR_SCENE_NAME,
-    ATTR_TRANSITION,
-    CONF_ALLOW_HUE_GROUPS,
-    CONF_ALLOW_UNREACHABLE,
-    DEFAULT_ALLOW_HUE_GROUPS,
-    DEFAULT_ALLOW_UNREACHABLE,
-    DOMAIN,
-)
+from .bridge import HueBridge, HueConfigEntry, _async_register_bridge_device
+from .const import DOMAIN
+from .migration import check_migration
+from .services import async_setup_services
 
-_LOGGER = logging.getLogger(__name__)
-SERVICE_HUE_SCENE = "hue_activate_scene"
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_setup_entry(
-    hass: core.HomeAssistant, entry: config_entries.ConfigEntry
-):
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up Hue integration."""
+
+    async_setup_services(hass)
+
+    return True
+
+
+async def async_migrate_entry(hass: HomeAssistant, entry: HueConfigEntry) -> None:
+    """Migrate old entry."""
+    if entry.minor_version < 2:
+        _migrate_zigbee_connections(hass, entry)
+        hass.config_entries.async_update_entry(entry, minor_version=2)
+
+
+@callback
+def _migrate_zigbee_connections(hass: HomeAssistant, entry: HueConfigEntry) -> None:
+    """Remove zigbee macs that were incorrectly stored as network macs.
+
+    Device setup adds them back as zigbee connections. Multi-channel devices
+    share one zigbee mac, which older versions stored on each channel, and only
+    setup knows which channel should own it.
+    """
+    dev_reg = dr.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        # Zigbee macs have 8 octets, network macs have 6.
+        zigbee_connections = {
+            (conn_type, value)
+            for conn_type, value in device.connections
+            if conn_type == dr.CONNECTION_NETWORK_MAC and value.count(":") == 7
+        }
+        if not zigbee_connections:
+            continue
+        dev_reg.async_update_device(
+            device.id, new_connections=device.connections - zigbee_connections
+        )
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: HueConfigEntry) -> None:
     """Set up a bridge from a config entry."""
+    # check (and run) migrations if needed
+    await check_migration(hass, entry)
 
-    # Migrate allow_unreachable from config entry data to config entry options
-    if (
-        CONF_ALLOW_UNREACHABLE not in entry.options
-        and CONF_ALLOW_UNREACHABLE in entry.data
-        and entry.data[CONF_ALLOW_UNREACHABLE] != DEFAULT_ALLOW_UNREACHABLE
-    ):
-        options = {
-            **entry.options,
-            CONF_ALLOW_UNREACHABLE: entry.data[CONF_ALLOW_UNREACHABLE],
-        }
-        data = entry.data.copy()
-        data.pop(CONF_ALLOW_UNREACHABLE)
-        hass.config_entries.async_update_entry(entry, data=data, options=options)
-
-    # Migrate allow_hue_groups from config entry data to config entry options
-    if (
-        CONF_ALLOW_HUE_GROUPS not in entry.options
-        and CONF_ALLOW_HUE_GROUPS in entry.data
-        and entry.data[CONF_ALLOW_HUE_GROUPS] != DEFAULT_ALLOW_HUE_GROUPS
-    ):
-        options = {
-            **entry.options,
-            CONF_ALLOW_HUE_GROUPS: entry.data[CONF_ALLOW_HUE_GROUPS],
-        }
-        data = entry.data.copy()
-        data.pop(CONF_ALLOW_HUE_GROUPS)
-        hass.config_entries.async_update_entry(entry, data=data, options=options)
-
+    # setup the bridge instance
     bridge = HueBridge(hass, entry)
+    if not await bridge.async_initialize_bridge():
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="bridge_initialization_failed",
+            translation_placeholders={"host": entry.data[CONF_HOST]},
+        )
 
-    if not await bridge.async_setup():
-        return False
-
-    _register_services(hass)
-
-    config = bridge.api.config
+    api = bridge.api
 
     # For backwards compat
-    unique_id = normalize_bridge_id(config.bridgeid)
+    unique_id = normalize_bridge_id(api.config.bridge_id)
     if entry.unique_id is None:
         hass.config_entries.async_update_entry(entry, unique_id=unique_id)
 
     # For recovering from bug where we incorrectly assumed homekit ID = bridge ID
+    # Remove this logic after Home Assistant 2022.4
     elif entry.unique_id != unique_id:
         # Find entries with this unique ID
         other_entry = next(
@@ -84,104 +88,44 @@ async def async_setup_entry(
             ),
             None,
         )
-
         if other_entry is None:
             # If no other entry, update unique ID of this entry ID.
             hass.config_entries.async_update_entry(entry, unique_id=unique_id)
 
-        elif other_entry.source == config_entries.SOURCE_IGNORE:
-            # There is another entry but it is ignored, delete that one and update this one
+        elif other_entry.source == SOURCE_IGNORE:
+            # There is another entry but it is ignored, delete that
+            # one and update this one
             hass.async_create_task(
                 hass.config_entries.async_remove(other_entry.entry_id)
             )
             hass.config_entries.async_update_entry(entry, unique_id=unique_id)
         else:
-            # There is another entry that already has the right unique ID. Delete this entry
+            # There is another entry that already has the right unique
+            # ID. Delete this entry
             hass.async_create_task(hass.config_entries.async_remove(entry.entry_id))
-            return False
+            raise ConfigEntryError(
+                translation_domain=DOMAIN,
+                translation_key="duplicate_entry",
+            )
 
-    device_registry = dr.async_get(hass)
-    device_registry.async_get_or_create(
-        config_entry_id=entry.entry_id,
-        connections={(dr.CONNECTION_NETWORK_MAC, config.mac)},
-        identifiers={(DOMAIN, config.bridgeid)},
-        manufacturer="Signify",
-        name=config.name,
-        model=config.modelid,
-        sw_version=config.swversion,
-    )
-
-    if config.modelid == "BSB002" and config.swversion < "1935144040":
-        persistent_notification.async_create(
-            hass,
-            "Your Hue hub has a known security vulnerability ([CVE-2020-6007](https://cve.circl.lu/cve/CVE-2020-6007)). Go to the Hue app and check for software updates.",
-            "Signify Hue",
-            "hue_hub_firmware",
+    # v1 bridges already register their device before platform forwarding, so
+    # light/sensor entities can resolve it as their via_device parent; only
+    # register it here if that has not already happened. v2 bridges are always
+    # (re)registered here to merge the network MAC connection into the bridge
+    # device created by async_setup_devices with only its Zigbee MAC.
+    if bridge.api_version != 1 or (
+        dr.async_get(hass).async_get_device_by_identifier(
+            (DOMAIN, api.config.bridge_id), entry.entry_id
         )
-
-    elif config.swupdate2_bridge_state == "readytoinstall":
-        err = (
-            "Please check for software updates of the bridge in the Philips Hue App.",
-            "Signify Hue",
-            "hue_hub_firmware",
-        )
-        _LOGGER.warning(err)
-
-    return True
+        is None
+    ):
+        _async_register_bridge_device(hass, entry, api, bridge.api_version)
 
 
-async def async_unload_entry(hass, entry):
+async def async_unload_entry(hass: HomeAssistant, entry: HueConfigEntry) -> None:
     """Unload a config entry."""
-    unload_success = await hass.data[DOMAIN][entry.entry_id].async_reset()
-    if len(hass.data[DOMAIN]) == 0:
-        hass.data.pop(DOMAIN)
-        hass.services.async_remove(DOMAIN, SERVICE_HUE_SCENE)
-    return unload_success
-
-
-@core.callback
-def _register_services(hass):
-    """Register Hue services."""
-
-    async def hue_activate_scene(call, skip_reload=True):
-        """Handle activation of Hue scene."""
-        # Get parameters
-        group_name = call.data[ATTR_GROUP_NAME]
-        scene_name = call.data[ATTR_SCENE_NAME]
-
-        # Call the set scene function on each bridge
-        tasks = [
-            bridge.hue_activate_scene(
-                call.data, skip_reload=skip_reload, hide_warnings=skip_reload
-            )
-            for bridge in hass.data[DOMAIN].values()
-            if isinstance(bridge, HueBridge)
-        ]
-        results = await asyncio.gather(*tasks)
-
-        # Did *any* bridge succeed? If not, refresh / retry
-        # Note that we'll get a "None" value for a successful call
-        if None not in results:
-            if skip_reload:
-                await hue_activate_scene(call, skip_reload=False)
-                return
-            _LOGGER.warning(
-                "No bridge was able to activate " "scene %s in group %s",
-                scene_name,
-                group_name,
-            )
-
-    if not hass.services.has_service(DOMAIN, SERVICE_HUE_SCENE):
-        # Register a local handler for scene activation
-        hass.services.async_register(
-            DOMAIN,
-            SERVICE_HUE_SCENE,
-            verify_domain_control(hass, DOMAIN)(hue_activate_scene),
-            schema=vol.Schema(
-                {
-                    vol.Required(ATTR_GROUP_NAME): cv.string,
-                    vol.Required(ATTR_SCENE_NAME): cv.string,
-                    vol.Optional(ATTR_TRANSITION): cv.positive_int,
-                }
-            ),
+    if not await entry.runtime_data.async_reset():
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="unload_failed",
         )

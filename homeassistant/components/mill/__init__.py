@@ -1,64 +1,76 @@
 """The mill component."""
+
 from datetime import timedelta
-import logging
 
 from mill import Mill
+from mill_local import Mill as MillLocal
 
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.const import CONF_IP_ADDRESS, CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant, async_noop
 from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
+from homeassistant.helpers.typing import ConfigType
 
-from .const import DOMAIN
+from .const import CLOUD, CONNECTION_TYPE, DOMAIN, LOCAL
+from .coordinator import (
+    MillConfigEntry,
+    MillDataUpdateCoordinator,
+    MillHistoricDataUpdateCoordinator,
+)
+from .services import async_setup_services
 
-_LOGGER = logging.getLogger(__name__)
+PLATFORMS = [Platform.CLIMATE, Platform.NUMBER, Platform.SENSOR]
 
-PLATFORMS = ["climate", "sensor"]
+__all__ = ["CLOUD", "CONNECTION_TYPE", "DOMAIN", "LOCAL"]
 
-
-class MillDataUpdateCoordinator(DataUpdateCoordinator):
-    """Class to manage fetching Mill data."""
-
-    def __init__(
-        self,
-        hass: HomeAssistant,
-        *,
-        mill_data_connection: Mill,
-    ) -> None:
-        """Initialize global Mill data updater."""
-        self.mill_data_connection = mill_data_connection
-
-        super().__init__(
-            hass,
-            _LOGGER,
-            name=DOMAIN,
-            update_method=mill_data_connection.fetch_heater_and_sensor_data,
-            update_interval=timedelta(seconds=30),
-        )
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
-async def async_setup_entry(hass, entry):
-    """Set up the Mill heater."""
-    mill_data_connection = Mill(
-        entry.data[CONF_USERNAME],
-        entry.data[CONF_PASSWORD],
-        websession=async_get_clientsession(hass),
-    )
-    if not await mill_data_connection.connect():
-        raise ConfigEntryNotReady
-
-    hass.data[DOMAIN] = MillDataUpdateCoordinator(
-        hass,
-        mill_data_connection=mill_data_connection,
-    )
-
-    await hass.data[DOMAIN].async_config_entry_first_refresh()
-
-    hass.config_entries.async_setup_platforms(entry, PLATFORMS)
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Set up the Mill integration."""
+    async_setup_services(hass)
     return True
 
 
-async def async_unload_entry(hass, entry):
+async def async_setup_entry(hass: HomeAssistant, entry: MillConfigEntry) -> None:
+    """Set up the Mill heater."""
+    if entry.data.get(CONNECTION_TYPE) == LOCAL:
+        mill_data_connection = MillLocal(
+            entry.data[CONF_IP_ADDRESS],
+            websession=async_get_clientsession(hass),
+        )
+        update_interval = timedelta(seconds=15)
+    else:
+        mill_data_connection = Mill(
+            entry.data[CONF_USERNAME],
+            entry.data[CONF_PASSWORD],
+            websession=async_get_clientsession(hass),
+        )
+        update_interval = timedelta(seconds=30)
+
+        historic_data_coordinator = MillHistoricDataUpdateCoordinator(
+            hass,
+            entry,
+            mill_data_connection=mill_data_connection,
+        )
+        historic_data_coordinator.async_add_listener(async_noop)
+        await historic_data_coordinator.async_config_entry_first_refresh()
+    try:
+        if not await mill_data_connection.connect():
+            raise ConfigEntryNotReady
+    except TimeoutError as error:
+        raise ConfigEntryNotReady from error
+    data_coordinator = MillDataUpdateCoordinator(
+        hass, entry, mill_data_connection, update_interval
+    )
+
+    await data_coordinator.async_config_entry_first_refresh()
+    entry.runtime_data = data_coordinator
+
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: MillConfigEntry) -> None:
     """Unload a config entry."""
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    await hass.config_entries.async_unload_platforms_or_raise(entry, PLATFORMS)

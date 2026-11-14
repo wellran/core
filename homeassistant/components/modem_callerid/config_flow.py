@@ -1,44 +1,44 @@
 """Config flow for Modem Caller ID integration."""
-from __future__ import annotations
 
-import logging
-from typing import Any
+from typing import Any, override
 
-from phone_modem import DEFAULT_PORT, PhoneModem
-import serial.tools.list_ports
-from serial.tools.list_ports_common import ListPortInfo
-import voluptuous as vol
+from phone_modem import PhoneModem
+import probatio
 
-from homeassistant import config_entries
 from homeassistant.components import usb
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_DEVICE, CONF_NAME
-from homeassistant.data_entry_flow import FlowResult
+from homeassistant.helpers.service_info.usb import UsbServiceInfo
 
 from .const import DEFAULT_NAME, DOMAIN, EXCEPTIONS
 
-_LOGGER = logging.getLogger(__name__)
-
-DATA_SCHEMA = vol.Schema({"name": str, "device": str})
+DATA_SCHEMA = probatio.Schema({"name": str, "device": str})
 
 
-def _generate_unique_id(port: ListPortInfo) -> str:
+def _generate_unique_id(port: usb.USBDevice | usb.SerialDevice) -> str:
     """Generate unique id from usb attributes."""
-    return f"{port.vid}:{port.pid}_{port.serial_number}_{port.manufacturer}_{port.description}"
+    vid = port.vid if isinstance(port, usb.USBDevice) else None
+    pid = port.pid if isinstance(port, usb.USBDevice) else None
+    return f"{vid}:{pid}_{port.serial_number}_{port.manufacturer}_{port.description}"
 
 
-class PhoneModemFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class PhoneModemFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Phone Modem."""
 
     def __init__(self) -> None:
         """Set up flow instance."""
         self._device: str | None = None
 
-    async def async_step_usb(self, discovery_info: dict[str, str]) -> FlowResult:
+    @override
+    async def async_step_usb(self, discovery_info: UsbServiceInfo) -> ConfigFlowResult:
         """Handle USB Discovery."""
-        device = discovery_info["device"]
-
-        dev_path = await self.hass.async_add_executor_job(usb.get_serial_by_id, device)
-        unique_id = f"{discovery_info['vid']}:{discovery_info['pid']}_{discovery_info['serial_number']}_{discovery_info['manufacturer']}_{discovery_info['description']}"
+        dev_path = discovery_info.device
+        unique_id = (
+            f"{discovery_info.vid}:{discovery_info.pid}"
+            f"_{discovery_info.serial_number}"
+            f"_{discovery_info.manufacturer}"
+            f"_{discovery_info.description}"
+        )
         if (
             await self.validate_device_errors(dev_path=dev_path, unique_id=unique_id)
             is None
@@ -49,47 +49,45 @@ class PhoneModemFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_usb_confirm(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle USB Discovery confirmation."""
         if user_input is not None:
             return self.async_create_entry(
                 title=user_input.get(CONF_NAME, DEFAULT_NAME),
                 data={CONF_DEVICE: self._device},
             )
-        self._set_confirm_only()
         return self.async_show_form(step_id="usb_confirm")
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors: dict[str, str] | None = {}
         if self._async_in_progress():
             return self.async_abort(reason="already_in_progress")
-        ports = await self.hass.async_add_executor_job(serial.tools.list_ports.comports)
+        ports = await usb.async_scan_serial_ports(self.hass)
         existing_devices = [
             entry.data[CONF_DEVICE] for entry in self._async_current_entries()
         ]
-        unused_ports = [
+        port_map = {
             usb.human_readable_device_name(
                 port.device,
                 port.serial_number,
                 port.manufacturer,
                 port.description,
-                port.vid,
-                port.pid,
-            )
+                port.vid if isinstance(port, usb.USBDevice) else None,
+                port.pid if isinstance(port, usb.USBDevice) else None,
+            ): port
             for port in ports
             if port.device not in existing_devices
-        ]
-        if not unused_ports:
+        }
+        if not port_map:
             return self.async_abort(reason="no_devices_found")
 
         if user_input is not None:
-            port = ports[unused_ports.index(str(user_input.get(CONF_DEVICE)))]
-            dev_path = await self.hass.async_add_executor_job(
-                usb.get_serial_by_id, port.device
-            )
+            port = port_map[user_input[CONF_DEVICE]]
+            dev_path = port.device
             errors = await self.validate_device_errors(
                 dev_path=dev_path, unique_id=_generate_unique_id(port)
             )
@@ -99,32 +97,10 @@ class PhoneModemFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                     data={CONF_DEVICE: dev_path},
                 )
         user_input = user_input or {}
-        schema = vol.Schema({vol.Required(CONF_DEVICE): vol.In(unused_ports)})
+        schema = probatio.Schema(
+            {probatio.Required(CONF_DEVICE): probatio.In(list(port_map))}
+        )
         return self.async_show_form(step_id="user", data_schema=schema, errors=errors)
-
-    async def async_step_import(self, config: dict[str, Any]) -> FlowResult:
-        """Import a config entry from configuration.yaml."""
-        if self._async_current_entries():
-            _LOGGER.warning(
-                "Loading Modem_callerid via platform setup is deprecated; Please remove it from your configuration"
-            )
-        if CONF_DEVICE not in config:
-            config[CONF_DEVICE] = DEFAULT_PORT
-        ports = await self.hass.async_add_executor_job(serial.tools.list_ports.comports)
-        for port in ports:
-            if port.device == config[CONF_DEVICE]:
-                if (
-                    await self.validate_device_errors(
-                        dev_path=port.device,
-                        unique_id=_generate_unique_id(port),
-                    )
-                    is None
-                ):
-                    return self.async_create_entry(
-                        title=config.get(CONF_NAME, DEFAULT_NAME),
-                        data={CONF_DEVICE: port.device},
-                    )
-        return self.async_abort(reason="cannot_connect")
 
     async def validate_device_errors(
         self, dev_path: str, unique_id: str
@@ -138,5 +114,5 @@ class PhoneModemFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
             await api.test(dev_path)
         except EXCEPTIONS:
             return {"base": "cannot_connect"}
-        else:
-            return None
+
+        return None

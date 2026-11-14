@@ -1,14 +1,17 @@
 """Config flow to configure forked-daapd devices."""
+
 from contextlib import suppress
 import logging
+from typing import Any, override
 
+import probatio
 from pyforked_daapd import ForkedDaapdAPI
-import voluptuous as vol
 
-from homeassistant import config_entries
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
 from homeassistant.const import CONF_HOST, CONF_NAME, CONF_PASSWORD, CONF_PORT
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .const import (
     CONF_LIBRESPOT_JAVA_PORT,
@@ -20,15 +23,16 @@ from .const import (
     DEFAULT_TTS_VOLUME,
     DOMAIN,
 )
+from .coordinator import ForkedDaapdConfigEntry
 
 _LOGGER = logging.getLogger(__name__)
 
 
-# Can't use all vol types: https://github.com/home-assistant/core/issues/32819
+# Can't use all probatio types: https://github.com/home-assistant/core/issues/32819
 DATA_SCHEMA_DICT = {
-    vol.Required(CONF_HOST): str,
-    vol.Optional(CONF_PORT, default=DEFAULT_PORT): int,
-    vol.Optional(CONF_PASSWORD, default=""): str,
+    probatio.Required(CONF_HOST): str,
+    probatio.Optional(CONF_PORT, default=DEFAULT_PORT): int,
+    probatio.Optional(probatio.Secret(CONF_PASSWORD), default=""): str,
 }
 
 TEST_CONNECTION_ERROR_DICT = {
@@ -41,41 +45,39 @@ TEST_CONNECTION_ERROR_DICT = {
 }
 
 
-class ForkedDaapdOptionsFlowHandler(config_entries.OptionsFlow):
+class ForkedDaapdOptionsFlowHandler(OptionsFlow):
     """Handle a forked-daapd options flow."""
 
-    def __init__(self, config_entry):
-        """Initialize."""
-        self.config_entry = config_entry
-
-    async def async_step_init(self, user_input=None):
+    async def async_step_init(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Manage the options."""
         if user_input is not None:
             return self.async_create_entry(title="options", data=user_input)
 
         return self.async_show_form(
             step_id="init",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_TTS_PAUSE_TIME,
                         default=self.config_entry.options.get(
                             CONF_TTS_PAUSE_TIME, DEFAULT_TTS_PAUSE_TIME
                         ),
                     ): float,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_TTS_VOLUME,
                         default=self.config_entry.options.get(
                             CONF_TTS_VOLUME, DEFAULT_TTS_VOLUME
                         ),
                     ): float,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_LIBRESPOT_JAVA_PORT,
                         default=self.config_entry.options.get(
                             CONF_LIBRESPOT_JAVA_PORT, 24879
                         ),
                     ): int,
-                    vol.Optional(
+                    probatio.Optional(
                         CONF_MAX_PLAYLISTS,
                         default=self.config_entry.options.get(CONF_MAX_PLAYLISTS, 10),
                     ): int,
@@ -90,27 +92,30 @@ def fill_in_schema_dict(some_input):
     for field, _type in DATA_SCHEMA_DICT.items():
         if some_input.get(str(field)):
             schema_dict[
-                vol.Optional(str(field), default=some_input[str(field)])
+                probatio.Optional(str(field), default=some_input[str(field)])
             ] = _type
         else:
             schema_dict[field] = _type
     return schema_dict
 
 
-class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
+class ForkedDaapdFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle a forked-daapd config flow."""
 
     VERSION = 1
 
-    def __init__(self):
+    def __init__(self) -> None:
         """Initialize."""
-        self.discovery_schema = None
+        self.discovery_schema: probatio.Schema | None = None
 
     @staticmethod
     @callback
-    def async_get_options_flow(config_entry):
+    @override
+    def async_get_options_flow(
+        config_entry: ForkedDaapdConfigEntry,
+    ) -> ForkedDaapdOptionsFlowHandler:
         """Return options flow handler."""
-        return ForkedDaapdOptionsFlowHandler(config_entry)
+        return ForkedDaapdOptionsFlowHandler()
 
     async def validate_input(self, user_input):
         """Validate the user input."""
@@ -126,7 +131,10 @@ class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         )
         return validate_result
 
-    async def async_step_user(self, user_input=None):
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
         """Handle a forked-daapd config flow start.
 
         Manage device specific parameters.
@@ -142,7 +150,7 @@ class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 )
             return self.async_show_form(
                 step_id="user",
-                data_schema=vol.Schema(fill_in_schema_dict(user_input)),
+                data_schema=probatio.Schema(fill_in_schema_dict(user_input)),
                 errors={"base": validate_result[0]},
             )
         if self.discovery_schema:  # stop at form to allow user to set up manually
@@ -150,39 +158,41 @@ class ForkedDaapdFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 step_id="user", data_schema=self.discovery_schema, errors={}
             )
         return self.async_show_form(
-            step_id="user", data_schema=vol.Schema(DATA_SCHEMA_DICT), errors={}
+            step_id="user", data_schema=probatio.Schema(DATA_SCHEMA_DICT), errors={}
         )
 
-    async def async_step_zeroconf(self, discovery_info):
+    @override
+    async def async_step_zeroconf(
+        self, discovery_info: ZeroconfServiceInfo
+    ) -> ConfigFlowResult:
         """Prepare configuration for a discovered forked-daapd device."""
         version_num = 0
-        if discovery_info.get("properties") and discovery_info["properties"].get(
-            "Machine Name"
-        ):
+        zeroconf_properties = discovery_info.properties
+        if zeroconf_properties.get("Machine Name"):
             with suppress(ValueError):
                 version_num = int(
-                    discovery_info["properties"].get("mtd-version", "0").split(".")[0]
+                    zeroconf_properties.get("mtd-version", "0").split(".")[0]
                 )
         if version_num < 27:
             return self.async_abort(reason="not_forked_daapd")
-        await self.async_set_unique_id(discovery_info["properties"]["Machine Name"])
+        await self.async_set_unique_id(zeroconf_properties["Machine Name"])
         self._abort_if_unique_id_configured()
 
         # Update title and abort if we already have an entry for this host
         for entry in self._async_current_entries():
-            if entry.data.get(CONF_HOST) != discovery_info["host"]:
+            if entry.data.get(CONF_HOST) != discovery_info.host:
                 continue
             self.hass.config_entries.async_update_entry(
                 entry,
-                title=discovery_info["properties"]["Machine Name"],
+                title=zeroconf_properties["Machine Name"],
             )
             return self.async_abort(reason="already_configured")
 
         zeroconf_data = {
-            CONF_HOST: discovery_info["host"],
-            CONF_PORT: int(discovery_info["port"]),
-            CONF_NAME: discovery_info["properties"]["Machine Name"],
+            CONF_HOST: discovery_info.host,
+            CONF_PORT: discovery_info.port,
+            CONF_NAME: zeroconf_properties["Machine Name"],
         }
-        self.discovery_schema = vol.Schema(fill_in_schema_dict(zeroconf_data))
+        self.discovery_schema = probatio.Schema(fill_in_schema_dict(zeroconf_data))
         self.context.update({"title_placeholders": zeroconf_data})
         return await self.async_step_user()

@@ -1,30 +1,42 @@
 """Config flow for the Total Connect component."""
+
+from collections.abc import Mapping
+from typing import TYPE_CHECKING, Any, override
+
+import probatio
 from total_connect_client.client import TotalConnectClient
-import voluptuous as vol
+from total_connect_client.exceptions import AuthenticationError
 
-from homeassistant import config_entries
-from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlow
+from homeassistant.const import CONF_LOCATION, CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import callback
+from homeassistant.helpers.typing import VolDictType
 
-from .const import CONF_USERCODES, DOMAIN
+from .const import AUTO_BYPASS, CODE_REQUIRED, CONF_USERCODES, DOMAIN
+from .coordinator import TotalConnectConfigEntry
 
-CONF_LOCATION = "location"
+PASSWORD_DATA_SCHEMA = probatio.Schema(
+    {probatio.Required(probatio.Secret(CONF_PASSWORD)): str}
+)
 
-PASSWORD_DATA_SCHEMA = vol.Schema({vol.Required(CONF_PASSWORD): str})
 
-
-class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class TotalConnectConfigFlow(ConfigFlow, domain=DOMAIN):
     """Total Connect config flow."""
 
     VERSION = 1
 
-    def __init__(self):
-        """Initialize the config flow."""
-        self.username = None
-        self.password = None
-        self.usercodes = {}
-        self.client = None
+    client: TotalConnectClient
 
-    async def async_step_user(self, user_input=None):
+    def __init__(self) -> None:
+        """Initialize the config flow."""
+        self.username: str | None = None
+        self.password: str | None = None
+        self.usercodes: dict[int, str | None] = {}
+
+    @override
+    async def async_step_user(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Handle a flow initiated by the user."""
         errors = {}
 
@@ -36,39 +48,44 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             await self.async_set_unique_id(username)
             self._abort_if_unique_id_configured()
 
-            client = await self.hass.async_add_executor_job(
-                TotalConnectClient, username, password, None
-            )
-
-            if client.is_valid_credentials():
+            try:
+                client = await self.hass.async_add_executor_job(
+                    TotalConnectClient, username, password, None
+                )
+            except AuthenticationError:
+                errors["base"] = "invalid_auth"
+            else:
                 # username/password valid so show user locations
                 self.username = username
                 self.password = password
                 self.client = client
                 return await self.async_step_locations()
-            # authentication failed / invalid
-            errors["base"] = "invalid_auth"
 
-        data_schema = vol.Schema(
-            {vol.Required(CONF_USERNAME): str, vol.Required(CONF_PASSWORD): str}
+        data_schema = probatio.Schema(
+            {
+                probatio.Required(CONF_USERNAME): str,
+                probatio.Required(probatio.Secret(CONF_PASSWORD)): str,
+            }
         )
 
         return self.async_show_form(
             step_id="user", data_schema=data_schema, errors=errors
         )
 
-    async def async_step_locations(self, user_entry=None):
+    async def async_step_locations(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Handle the user locations and associated usercodes."""
         errors = {}
-        if user_entry is not None:
+        if user_input is not None:
             for location_id in self.usercodes:
                 if self.usercodes[location_id] is None:
                     valid = await self.hass.async_add_executor_job(
                         self.client.locations[location_id].set_usercode,
-                        user_entry[CONF_USERCODES],
+                        user_input[CONF_USERCODES],
                     )
                     if valid:
-                        self.usercodes[location_id] = user_entry[CONF_USERCODES]
+                        self.usercodes[location_id] = user_input[CONF_USERCODES]
                     else:
                         errors[CONF_LOCATION] = "usercode"
                     break
@@ -88,24 +105,26 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     },
                 )
         else:
+            if self.client.get_number_locations() < 1:
+                return self.async_abort(reason="no_locations")
             for location_id in self.client.locations:
                 self.usercodes[location_id] = None
 
         # show the next location that needs a usercode
-        location_codes = {}
+        location_codes: VolDictType = {}
         location_for_user = ""
         for location_id in self.usercodes:
             if self.usercodes[location_id] is None:
-                location_for_user = location_id
+                location_for_user = str(location_id)
                 location_codes[
-                    vol.Required(
+                    probatio.Required(
                         CONF_USERCODES,
                         default="0000",
                     )
                 ] = str
                 break
 
-        data_schema = vol.Schema(location_codes)
+        data_schema = probatio.Schema(location_codes)
         return self.async_show_form(
             step_id="locations",
             data_schema=data_schema,
@@ -113,14 +132,18 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             description_placeholders={"location_id": location_for_user},
         )
 
-    async def async_step_reauth(self, config):
+    async def async_step_reauth(
+        self, entry_data: Mapping[str, Any]
+    ) -> ConfigFlowResult:
         """Perform reauth upon an authentication error or no usercode."""
-        self.username = config[CONF_USERNAME]
-        self.usercodes = config[CONF_USERCODES]
+        self.username = entry_data[CONF_USERNAME]
+        self.usercodes = entry_data[CONF_USERCODES]
 
         return await self.async_step_reauth_confirm()
 
-    async def async_step_reauth_confirm(self, user_input=None):
+    async def async_step_reauth_confirm(
+        self, user_input: dict[str, str] | None = None
+    ) -> ConfigFlowResult:
         """Dialog that informs the user that reauth is required."""
         errors = {}
         if user_input is None:
@@ -129,14 +152,14 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                 data_schema=PASSWORD_DATA_SCHEMA,
             )
 
-        client = await self.hass.async_add_executor_job(
-            TotalConnectClient,
-            self.username,
-            user_input[CONF_PASSWORD],
-            self.usercodes,
-        )
-
-        if not client.is_valid_credentials():
+        try:
+            await self.hass.async_add_executor_job(
+                TotalConnectClient,
+                self.username,
+                user_input[CONF_PASSWORD],
+                self.usercodes,
+            )
+        except AuthenticationError:
             errors["base"] = "invalid_auth"
             return self.async_show_form(
                 step_id="reauth_confirm",
@@ -145,6 +168,8 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             )
 
         existing_entry = await self.async_set_unique_id(self.username)
+        if TYPE_CHECKING:
+            assert existing_entry is not None
         new_entry = {
             CONF_USERNAME: self.username,
             CONF_PASSWORD: user_input[CONF_PASSWORD],
@@ -157,3 +182,39 @@ class TotalConnectConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         )
 
         return self.async_abort(reason="reauth_successful")
+
+    @staticmethod
+    @callback
+    @override
+    def async_get_options_flow(
+        config_entry: TotalConnectConfigEntry,
+    ) -> TotalConnectOptionsFlowHandler:
+        """Get options flow."""
+        return TotalConnectOptionsFlowHandler()
+
+
+class TotalConnectOptionsFlowHandler(OptionsFlow):
+    """TotalConnect options flow handler."""
+
+    async def async_step_init(
+        self, user_input: dict[str, bool] | None = None
+    ) -> ConfigFlowResult:
+        """Manage the options."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=probatio.Schema(
+                {
+                    probatio.Required(
+                        AUTO_BYPASS,
+                        default=self.config_entry.options.get(AUTO_BYPASS, False),
+                    ): bool,
+                    probatio.Required(
+                        CODE_REQUIRED,
+                        default=self.config_entry.options.get(CODE_REQUIRED, False),
+                    ): bool,
+                }
+            ),
+        )
